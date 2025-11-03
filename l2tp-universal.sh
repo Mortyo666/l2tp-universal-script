@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 # l2tp-universal.sh with universal backup and rollback
 # Author: Mortyo666 (updated)
 # Commit: Добавлен режим бэкапов и универсального безопасного отката l2tp-universal-rollback
-
 # Colors
 NC="\033[0m"; RED="\033[0;31m"; GREEN="\033[0;32m"; YELLOW="\033[1;33m"; BLUE="\033[0;34m"
-
 # Globals
 DATE_TAG="$(date +%Y%m%d-%H%M%S)"
 BACKUP_ROOT="/root/l2tp-universal-backup-${DATE_TAG}"
 BACKUP_BASE="/root"
 LAST_LINK="/root/l2tp-universal-backup-latest"
 OUT_FILE="/root/l2tp-clients-${DATE_TAG}.txt"
-
 # Files and paths we manage
 CONF_FILES=(
   "/etc/xl2tpd/xl2tpd.conf"
@@ -24,36 +20,29 @@ CONF_FILES=(
   "/etc/ppp/chap-secrets"
   "/etc/sysctl.conf"
 )
-
 SERVICES=(ipsec xl2tpd)
-
 # sysctl parameters we touch
 SYSCTL_KEYS=(
   "net.ipv4.ip_forward"
   "net.ipv4.conf.all.accept_redirects"
   "net.ipv4.conf.all.send_redirects"
 )
-
 # Helper: log
 log() { echo -e "${BLUE}[*]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err() { echo -e "${RED}[x]${NC} $*" 1>&2; }
 success() { echo -e "${GREEN}[✓]${NC} $*"; }
-
 require_root() {
   if [[ $(id -u) -ne 0 ]]; then err "Run as root"; exit 1; fi
 }
-
 # Detect primary interface for SNAT
 get_iface() {
   ip route get 1.1.1.1 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}' || true
 }
-
 # Backup current state (files, iptables, versions)
 backup_all() {
   mkdir -p "${BACKUP_ROOT}"
   log "Создание бэкапа в ${BACKUP_ROOT}"
-
   # Copy config files if they exist
   for f in "${CONF_FILES[@]}"; do
     if [[ -f "$f" ]]; then
@@ -65,32 +54,26 @@ backup_all() {
       touch "${BACKUP_ROOT}$f.absent"
     fi
   done
-
   # Save iptables
   mkdir -p "${BACKUP_ROOT}/iptables"
   iptables-save > "${BACKUP_ROOT}/iptables/iptables.save" 2>/dev/null || true
   ip6tables-save > "${BACKUP_ROOT}/iptables/ip6tables.save" 2>/dev/null || true
-
   # Save sysctl snapshot
   sysctl -a 2>/dev/null > "${BACKUP_ROOT}/sysctl-all.txt" || true
-
   # Save service states (enabled/active)
   mkdir -p "${BACKUP_ROOT}/systemd"
   for s in "${SERVICES[@]}"; do
     systemctl is-enabled "$s" >/dev/null 2>&1 && echo enabled > "${BACKUP_ROOT}/systemd/${s}.enabled" || echo disabled > "${BACKUP_ROOT}/systemd/${s}.enabled"
     systemctl is-active "$s" >/dev/null 2>&1 && echo active > "${BACKUP_ROOT}/systemd/${s}.active" || echo inactive > "${BACKUP_ROOT}/systemd/${s}.active"
   done
-
   ln -sfn "${BACKUP_ROOT}" "${LAST_LINK}"
   success "Бэкап создан: ${BACKUP_ROOT} (latest -> ${LAST_LINK})"
 }
-
 # Restore from backup directory
 restore_from_backup() {
-  local src="$1"
+  local src="${1:-}"
   if [[ -z "$src" || ! -d "$src" ]]; then err "Неверный путь бэкапа: $src"; exit 1; fi
   log "Откат из бэкапа: $src"
-
   # Restore config files: if .absent existed originally, remove now-created file; else copy back
   for f in "${CONF_FILES[@]}"; do
     if [[ -f "${src}$f.absent" ]]; then
@@ -103,7 +86,6 @@ restore_from_backup() {
       fi
     fi
   done
-
   # Restore iptables
   if [[ -f "${src}/iptables/iptables.save" ]]; then
     iptables-restore < "${src}/iptables/iptables.save" || warn "Не удалось восстановить iptables"
@@ -111,16 +93,14 @@ restore_from_backup() {
   if [[ -f "${src}/iptables/ip6tables.save" ]]; then
     ip6tables-restore < "${src}/iptables/ip6tables.save" || warn "Не удалось восстановить ip6tables"
   fi
-
   # Restore sysctl only selected keys
   for k in "${SYSCTL_KEYS[@]}"; do
-    if grep -q "^${k}=" "${src}/sysctl-all.txt" 2>/dev/null; then
+    if grep -q "^${k}=" "${src}/sysctl-all.txt" 2>/dev/null || grep -q "^${k} = " "${src}/sysctl-all.txt" 2>/dev/null; then
       local v
-      v=$(grep -m1 "^${k} =" "${src}/sysctl-all.txt" | awk -F' = ' '{print $2}')
-      if [[ -n "$v" ]]; then sysctl -w "${k}=${v}" >/dev/null 2>&1 || true; fi
+      v=$(grep -m1 -E "^${k}( = |=)" "${src}/sysctl-all.txt" | awk -F' = ' '{print $2}')
+      if [[ -n "${v:-}" ]]; then sysctl -w "${k}=${v}" >/dev/null 2>&1 || true; fi
     fi
   done
-
   # Restore service state
   for s in "${SERVICES[@]}"; do
     if [[ -f "${src}/systemd/${s}.enabled" ]]; then
@@ -132,27 +112,25 @@ restore_from_backup() {
       if grep -q active "${src}/systemd/${s}.active"; then systemctl restart "$s" >/dev/null 2>&1 || true; else systemctl stop "$s" >/dev/null 2>&1 || true; fi
     fi
   done
-
   success "Откат завершён"
 }
-
 # Install L2TP stack (minimal, placeholder for existing logic)
 install_l2tp() {
   require_root
   backup_all
-
   log "Установка пакетов"
   if command -v apt >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt update -y && apt install -y strongswan xl2tpd ppp
-  elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
-    (command -v dnf && PM=dnf || PM=yum)
-    $PM -y install epel-release || true
-    $PM -y install strongswan xl2tpd ppp || $PM -y install libreswan xl2tpd ppp
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    # Choose package manager reliably without subshell; avoid unbound variable
+    local PKG_MGR=""
+    if command -v dnf >/dev/null 2>&1; then PKG_MGR=dnf; else PKG_MGR=yum; fi
+    ${PKG_MGR} -y install epel-release || true
+    ${PKG_MGR} -y install strongswan xl2tpd ppp || ${PKG_MGR} -y install libreswan xl2tpd ppp || true
   else
     warn "Неизвестный пакетный менеджер — пропуск установки пакетов"
   fi
-
   log "Конфигурирование"
   mkdir -p /etc/xl2tpd /etc/ppp
   : > /etc/xl2tpd/xl2tpd.conf
@@ -160,7 +138,6 @@ install_l2tp() {
   : > /etc/ipsec.secrets
   : > /etc/ppp/options.xl2tpd
   : > /etc/ppp/chap-secrets
-
   # Minimal safe defaults (replace with your current generation logic if exists)
   cat >/etc/xl2tpd/xl2tpd.conf <<'EOF'
 [global]
@@ -175,7 +152,6 @@ ppp debug = yes
 pppoptfile = /etc/ppp/options.xl2tpd
 length bit = yes
 EOF
-
   cat >/etc/ppp/options.xl2tpd <<'EOF'
 ipcp-accept-local
 ipcp-accept-remote
@@ -196,9 +172,7 @@ refuse-mschap
 noccp
 connect-delay 5000
 EOF
-
   echo "l2tp * password *" > /etc/ppp/chap-secrets
-
   cat >/etc/ipsec.conf <<'EOF'
 config setup
     charondebug="ike 1, knl 1, cfg 0"
@@ -212,30 +186,24 @@ conn L2TP-PSK
     rightprotoport=17/1701
     auto=add
 EOF
-
   echo ": PSK \"topsecret\"" > /etc/ipsec.secrets
-
   # sysctl
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sysctl -w net.ipv4.conf.all.accept_redirects=0 >/dev/null
   sysctl -w net.ipv4.conf.all.send_redirects=0 >/dev/null
-
   # firewall SNAT
   local IFACE
   IFACE="${IFACE_OVERRIDE:-$(get_iface)}"
-  if [[ -n "$IFACE" ]]; then
+  if [[ -n "${IFACE:-}" ]]; then
     iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
   else
     warn "Не удалось определить интерфейс для SNAT"
   fi
-
   # restart
   systemctl enable ipsec xl2tpd >/dev/null 2>&1 || true
   systemctl restart ipsec xl2tpd >/dev/null 2>&1 || true
-
   success "Установка завершена. Данные клиентов будут сохранены в ${OUT_FILE}"
 }
-
 # Rollback menu and actions
 rollback_menu() {
   require_root
@@ -246,13 +214,12 @@ rollback_menu() {
   echo "Доступные бэкапы:"; local i=1; for b in "${backups[@]}"; do echo "  $i) $b"; ((i++)); done
   read -rp "Введите номер бэкапа (или Enter для последнего): " choose || true
   local sel
-  if [[ -z "$choose" ]]; then sel="${backups[-1]}"; else
+  if [[ -z "${choose:-}" ]]; then sel="${backups[-1]}"; else
     if ! [[ "$choose" =~ ^[0-9]+$ ]] || (( choose < 1 || choose > ${#backups[@]} )); then err "Неверный выбор"; exit 1; fi
     sel="${backups[$((choose-1))]}"
   fi
   restore_from_backup "$sel"
 }
-
 main_menu() {
   echo "================ L2TP Universal ================="
   echo "1) Установка L2TP"
@@ -260,12 +227,10 @@ main_menu() {
   echo "q) Выход"
   echo "-----------------------------------------------"
 }
-
 main() {
   require_root
   if [[ "${1:-}" == "--install" ]]; then install_l2tp; return; fi
   if [[ "${1:-}" == "--rollback" ]]; then rollback_menu; return; fi
-
   while true; do
     main_menu
     read -rp "Выберите действие: " ans || true
@@ -277,7 +242,6 @@ main() {
     esac
   done
 }
-
 # README notice about OUTGOING_IPS retained from previous versions
 # ============ README NOTICE ============
 # Данный скрипт поддерживает явный список исходящих IP через переменную OUTGOING_IPS,
@@ -290,5 +254,4 @@ main() {
 # Если IP меньше, чем пользователей — выводится предупреждение, часть пользователей будет использовать первый IP.
 # Если IP больше — используются только нужные по количеству пользователей.
 # ======================================
-
 main "$@"
