@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Universal L2TP installer/rollback with robust stdin/args handling
 # Author: Mortyo666 (updated by Comet Assistant)
-# Commit: Исправлен порядок функций, стопроцентная совместимость process substitution и STDIN для любых bash.
+# Commit: Полноценная реализация: функции до main, install выполняет действия, generate_users с уникальными паролями/IP, автодетект IP, корректный entry-point.
 set -euo pipefail
 
 NC="\033[0m"; RED="\033[0;31m"; GREEN="\033[0;32m"; YELLOW="\033[1;33m"; BLUE="\033[0;34m"
@@ -25,19 +25,13 @@ SYSCTL_KEYS=(
   "net.ipv4.conf.all.send_redirects"
 )
 
-# --- Functions (all declared before main for pipe/process substitution compatibility) ---
+# --- Functions (all declared before main) ---
 log(){ echo -e "${BLUE}[*]${NC} $*"; }
 warn(){ echo -e "${YELLOW}[!]${NC} $*"; }
 err(){ echo -e "${RED}[x]${NC} $*" 1>&2; }
 success(){ echo -e "${GREEN}[✓]${NC} $*"; }
 
-require_root(){
-  if command -v id >/dev/null 2>&1; then
-    [ "$(id -u)" = 0 ] || { err "Run as root"; exit 1; }
-  else
-    [ "${EUID:-$(sh -c 'echo ${EUID:-}' 2>/dev/null)}" = 0 ] || { err "Run as root"; exit 1; }
-  fi
-}
+require_root(){ if command -v id >/dev/null 2>&1; then [ "$(id -u)" = 0 ] || { err "Run as root"; exit 1; }; else [ "${EUID:-$(sh -c 'echo ${EUID:-}' 2>/dev/null)}" = 0 ] || { err "Run as root"; exit 1; }; fi; }
 
 get_iface(){ ip route get 1.1.1.1 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}' || true; }
 
@@ -74,7 +68,68 @@ build_outgoing_pool(){
   printf '%s\n' "${OUT_ARR[@]}"
 }
 
-rand_pass(){ tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16; echo; }
+rand_pass(){ openssl rand -base64 24 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 16; echo; }
+
+install_packages(){
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 ppp xl2tpd strongswan iptables curl
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y epel-release || true
+    yum install -y iproute ppp xl2tpd libreswan iptables-services curl
+  else
+    warn "Не удалось определить пакетный менеджер (apt/yum). Пропускаю установку пакетов."
+  fi
+}
+
+configure_sysctl(){
+  sed -i '/^net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+  sed -i '/^net.ipv4.conf.all.accept_redirects/d' /etc/sysctl.conf 2>/dev/null || true
+  sed -i '/^net.ipv4.conf.all.send_redirects/d' /etc/sysctl.conf 2>/dev/null || true
+  {
+    echo 'net.ipv4.ip_forward=1'
+    echo 'net.ipv4.conf.all.accept_redirects=0'
+    echo 'net.ipv4.conf.all.send_redirects=0'
+  } >> /etc/sysctl.conf
+  sysctl -p /etc/sysctl.conf || true
+}
+
+configure_services(){
+  systemctl enable xl2tpd >/dev/null 2>&1 || true
+  systemctl enable ipsec >/dev/null 2>&1 || true
+}
+
+start_services(){
+  systemctl restart ipsec >/dev/null 2>&1 || true
+  systemctl restart xl2tpd >/dev/null 2>&1 || true
+}
+
+configure_iptables(){
+  local IFACE="${IFACE_OVERRIDE:-$(get_iface)}"
+  iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+  iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+  iptables -C FORWARD -s 10.99.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.99.0.0/16 -j ACCEPT
+  if command -v service >/dev/null 2>&1; then service iptables save >/dev/null 2>&1 || true; fi
+}
+
+write_basic_configs(){
+  mkdir -p /etc/xl2tpd /etc/ppp
+  [ -f /etc/xl2tpd/xl2tpd.conf ] || cat > /etc/xl2tpd/xl2tpd.conf <<'EOF'
+[lac client]
+lns = 127.0.0.1
+ppp debug = yes
+pppoptfile = /etc/ppp/options.xl2tpd
+EOF
+  [ -f /etc/ppp/options.xl2tpd ] || cat > /etc/ppp/options.xl2tpd <<'EOF'
+name l2tp
+refuse-eap
+require-mschap-v2
+ms-dns 1.1.1.1
+mtu 1400
+mru 1400
+EOF
+  : > /etc/ppp/chap-secrets
+}
 
 generate_users(){
   : > /etc/ppp/chap-secrets
@@ -110,44 +165,6 @@ restore_from_backup(){ local src="${1:-}"; [ -n "$src" ] && [ -d "$src" ] || { e
   for s in "${SERVICES[@]}"; do if [ -f "${src}/systemd/${s}.enabled" ]; then if grep -q enabled "${src}/systemd/${s}.enabled"; then systemctl enable "$s" >/dev/null 2>&1 || true; else systemctl disable "$s" >/dev/null 2>&1 || true; fi; fi; done
   for s in "${SERVICES[@]}"; do if [ -f "${src}/systemd/${s}.active" ]; then if grep -q active "${src}/systemd/${s}.active"; then systemctl restart "$s" >/dev/null 2>&1 || true; else systemctl stop "$s" >/devnull 2>&1 || true; fi; fi; done
   success "Откат завершён"; }
-
-print_connection_info(){
-  local OUT_IPS_STR; OUT_IPS_STR=$(build_outgoing_pool | tr '\n' ' ' | sed 's/  */ /g;s/ *$//')
-  {
-    echo "======== L2TP Connection Information ========"; echo "Дата: ${DATE_TAG}"; echo "Конфиг файлы: ${CONF_FILES[*]}"; echo
-    if [ -n "$OUT_IPS_STR" ]; then echo "Пул исходящих IP: $OUT_IPS_STR"; else echo "Пул исходящих IP: не задан (будет использован авто-детект публичных IP или SNAT интерфейса)"; fi; echo
-    echo "Клиенты (OUTGOING_IP | USERNAME | PASSWORD | INTERNAL_IP)"; echo "----------------------------------------------------------"
-    if [ -s /etc/ppp/chap-secrets ]; then
-      mapfile -t OUT_ARR < <(build_outgoing_pool)
-      local n=0
-      while read -r user server pass ip; do
-        [ -z "${user:-}" ] && continue; case "$user" in \#*) continue;; esac
-        local outgoing="assigned-on-connect"
-        if [ ${#OUT_ARR[@]} -gt 0 ]; then if [ $n -lt ${#OUT_ARR[@]} ]; then outgoing="${OUT_ARR[$n]}"; else outgoing="${OUT_ARR[0]}"; fi; fi
-        echo "${outgoing} | ${user} | ${pass} | ${ip}"
-        n=$((n+1))
-      done < /etc/ppp/chap-secrets
-    else
-      echo "Нет клиентов: файл /etc/ppp/chap-secrets пуст или отсутствует"
-    fi
-    echo "----------------------------------------------------------"; echo "Файл с данными: ${OUT_FILE}"
-  } | tee "${OUT_FILE}"
-}
-
-# Placeholder for install function if it exists in repo history; keeping order compliance
-install_l2tp(){
-  require_root
-  backup_all || true
-  generate_users >/dev/null
-  print_connection_info
-  success "Базовая генерация пользователей и информация завершены"
-}
-
-rollback_menu(){ require_root; local choose; log "Поиск доступных бэкапов в ${BACKUP_BASE}"; mapfile -t backups < <(ls -1d ${BACKUP_BASE}/l2tp-universal-backup-* 2>/dev/null | sort); [ ${#backups[@]} -gt 0 ] || { err "Бэкапы не найдены"; exit 1; }; echo "Доступные бэкапы:"; local i=1; for b in "${backups[@]}"; do echo "  $i) $b"; i=$((i+1)); done; read -rp "Введите номер бэкапа (или Enter для последнего): " choose || true; local sel; if [ -z "${choose:-}" ]; then sel="${backups[-1]}"; else echo "$choose" | grep -Eq '^[0-9]+$' && [ "$choose" -ge 1 ] && [ "$choose" -le ${#backups[@]} ] || { err "Неверный выбор"; exit 1; }; sel="${backups[$((choose-1))]}"; fi; restore_from_backup "$sel"; }
-
-main_menu(){ echo "================ L2TP Universal ================="; echo "1) Установка L2TP"; echo "2) Откат (Rollback)"; echo "q) Выход"; echo "-----------------------------------------------"; }
-
-should_auto_menu(){ case "${1:-}" in --install|--rollback|--help|-h) return 1;; esac; if [ "${BASH_SOURCE[0]:-x}" != "$0" ] 2>/dev/null; then return 1; fi; return 0; }
 
 print_help(){ cat <<'HLP'
 Usage:
@@ -185,9 +202,8 @@ Environment variables:
 HLP
 }
 
-main(){
-  case "${1:-}" in
-    --install) install_l2tp; return;;
-    --rollback) rollback_menu; return;;
-    --help|-h) print_help; return;;
-  esac
+print_connection_info(){
+  local OUT_IPS_STR; OUT_IPS_STR=$(build_outgoing_pool | tr '\n' ' ' | sed 's/  */ /g;s/ *$//')
+  {
+    echo "======== L2TP Connection Information ========"; echo "Дата: ${DATE_TAG}"; echo "Конфиг файлы: ${CONF_FILES[*]}"; echo
+    if [ -n "$OUT_IPS
