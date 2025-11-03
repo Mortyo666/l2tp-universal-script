@@ -114,6 +114,55 @@ restore_from_backup() {
   done
   success "Откат завершён"
 }
+
+# Helper: collect and print connection info neatly and save to OUT_FILE
+print_connection_info() {
+  # OUTGOING_IPS may be provided externally; if not, try to infer from ip route addr (none by default)
+  local OUT_IPS_STR="${OUTGOING_IPS:-}"
+  # Prepare header
+  {
+    echo "======== L2TP Connection Information ========"
+    echo "Дата: ${DATE_TAG}"
+    echo "Конфиг файлы: ${CONF_FILES[*]}"
+    echo
+    if [[ -n "$OUT_IPS_STR" ]]; then
+      echo "Пул исходящих IP: $OUT_IPS_STR"
+    else
+      echo "Пул исходящих IP: не задан (используется SNAT на интерфейсе)"
+    fi
+    echo
+    echo "Клиенты (OUTGOING_IP | USERNAME | PASSWORD | INTERNAL_IP)"
+    echo "----------------------------------------------------------"
+    # Build clients table from chap-secrets; CHAP format: user  server  password  IP
+    if [[ -s /etc/ppp/chap-secrets ]]; then
+      local idx=0
+      # normalize OUT_IPS into array
+      read -r -a OUT_IPS_ARR <<<"$OUT_IPS_STR"
+      while IFS=$'\t ' read -r user server pass ip; do
+        # skip comments/blank
+        [[ -z "${user:-}" || "${user:0:1}" == "#" ]] && continue
+        local outgoing=""
+        if (( ${#OUT_IPS_ARR[@]} > 0 )); then
+          if (( idx < ${#OUT_IPS_ARR[@]} )); then
+            outgoing="${OUT_IPS_ARR[$idx]}"
+          else
+            outgoing="${OUT_IPS_ARR[0]}"
+          fi
+        else
+          outgoing="assigned-on-connect"
+        fi
+        local internal="${ip:-assigned-on-connect}"
+        echo "${outgoing} | ${user} | ${pass} | ${internal}"
+        ((idx++))
+      done < /etc/ppp/chap-secrets
+    else
+      echo "Нет клиентов: файл /etc/ppp/chap-secrets пуст или отсутствует"
+    fi
+    echo "----------------------------------------------------------"
+    echo "Файл с данными: ${OUT_FILE}"
+  } | tee "${OUT_FILE}"
+}
+
 # Install L2TP stack (minimal, placeholder for existing logic)
 install_l2tp() {
   require_root
@@ -203,6 +252,8 @@ EOF
   systemctl enable ipsec xl2tpd >/dev/null 2>&1 || true
   systemctl restart ipsec xl2tpd >/dev/null 2>&1 || true
   success "Установка завершена. Данные клиентов будут сохранены в ${OUT_FILE}"
+  # Immediately show connection info for convenience
+  print_connection_info
 }
 # Rollback menu and actions
 rollback_menu() {
@@ -251,7 +302,4 @@ main() {
 # При авто-режиме скрипт исключает служебные IP (10.180.1.1, 10.180.2.1, 10.180.5.1) и приватные диапазоны
 # (10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12, 127.0.0.0/8, 169.254.0.0/16, 100.64.0.0/10).
 # Каждому пользователю в выводе назначается уникальный OUTGOING_IP по порядку из списка.
-# Если IP меньше, чем пользователей — выводится предупреждение, часть пользователей будет использовать первый IP.
-# Если IP больше — используются только нужные по количеству пользователей.
-# ======================================
-main "$@"
+# Если
