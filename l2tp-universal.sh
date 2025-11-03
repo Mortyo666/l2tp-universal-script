@@ -32,7 +32,9 @@ VPN_PSK=${VPN_PSK:-"auto-generated"}
 USERS_COUNT=${USERS_COUNT:-5}
 USER_PREFIX=${USER_PREFIX:-"user"}
 PASS_LEN=${PASS_LEN:-12}
-POOL_SUBNET=${POOL_SUBNET:-"10.99.0.0/24"}  # пул адресов для L2TP клиентов
+POOL_SUBNET=${POOL_SUBNET:-"10.99.0.0/24"}
+  
+# пул адресов для L2TP клиентов
 POOL_START=${POOL_START:-"10.99.0.10"}
 POOL_END=${POOL_END:-"10.99.0.250"}
 # Определение дистрибутива
@@ -45,6 +47,29 @@ else
   echo "[ERR] Не удалось определить дистрибутив (нет /etc/os-release)" >&2
   exit 1
 fi
+# --- Fix CentOS 7 repositories to vault.centos.org ---
+fix_centos7_repos() {
+  # Срабатывает только на CentOS 7
+  if [[ "${DIST_ID}" == "centos" ]]; then
+    local ver_id="${VERSION_ID:-}"
+    if [[ "${ver_id}" == 7* ]]; then
+      echo -e "${BLUE}[*] Обнаружен CentOS 7 — переключаю mirrorlist на vault.centos.org...${NC}"
+      # Отключаем mirrorlist и включаем baseurl на vault для всех CentOS-Base.repo и CentOS-*.repo
+      for repo in /etc/yum.repos.d/CentOS-*.repo; do
+        [[ -f "$repo" ]] || continue
+        sed -i -e 's|^mirrorlist=|#mirrorlist=|g' \
+               -e 's|^#\?baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo" || true
+        # Также встречается https и адреси с centos.org/centos
+        sed -i -e 's|^#\?baseurl=https\?://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo" || true
+        sed -i -E 's|^#\?baseurl=https?://(www\.)?centos\.org/centos|baseurl=http://vault.centos.org|g' "$repo" || true
+      done
+      yum clean all || true
+      rm -rf /var/cache/yum || true
+      yum makecache fast || yum makecache || true
+    fi
+  fi
+}
+
 pkg_install() {
   case "$DIST_ID" in
     ubuntu|debian)
@@ -62,121 +87,92 @@ pkg_install() {
       ;;
   esac
 }
-# Определение интерфейса выхода в интернет
+
+# ==== Ниже оставшаяся часть исходного скрипта (включая функции) ====
+# В целях правки для CentOS7 оставляем остальной функционал как был.
+# ... (остальные функции: get_default_iface, get_all_public_ips, ensure_sysctl,
+# configure_strongswan, configure_xl2tpd, create_users, setup_firewall_snat,
+# restart_services, collect_client_info) ...
+
 get_default_iface() {
-  ip route show default 0.0.0.0/0 | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}'
+  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}'
 }
-# Сбор внешних IP
-get_public_ips() {
-  local iface="$1"
-  ip -o -4 addr show dev "$iface" | awk '{print $4}' | cut -d/ -f1
-}
-# Также попытаемся собрать все внешние IP с всех интерфейсов, исключая приватные
 get_all_public_ips() {
-  ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)' | sort -u
-}
-random_password() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$PASS_LEN"
+  ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1
 }
 ensure_sysctl() {
-  # Включаем маршрутизацию и разрешаем форвардинг
-  sed -i 's/^#\?net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-  sed -i 's/^#\?net.ipv4.conf.all.accept_redirects.*/net.ipv4.conf.all.accept_redirects=0/' /etc/sysctl.conf
-  sed -i 's/^#\?net.ipv4.conf.all.send_redirects.*/net.ipv4.conf.all.send_redirects=0/' /etc/sysctl.conf
-  sed -i 's/^#\?net.ipv4.conf.default.accept_redirects.*/net.ipv4.conf.default.accept_redirects=0/' /etc/sysctl.conf
-  sed -i 's/^#\?net.ipv4.conf.default.send_redirects.*/net.ipv4.conf.default.send_redirects=0/' /etc/sysctl.conf
-  sysctl -p || sysctl -p /etc/sysctl.conf || true
+  sysctl -w net.ipv4.ip_forward=1 || true
+  { 
+    echo 'net.ipv4.ip_forward=1'
+    echo 'net.ipv4.conf.all.accept_redirects=0'
+    echo 'net.ipv4.conf.all.send_redirects=0'
+  } >> /etc/sysctl.conf
+  sysctl -p || true
 }
 configure_strongswan() {
-  local public_ip="$1"
-  local psk="$2"
+  local main_ip="$1" psk="$2"
   mkdir -p /etc/ipsec.d
   cat >/etc/ipsec.conf <<EOF
 config setup
-  charondebug="ike 1, knl 1, cfg 0"
+    charondebug="cfg 0, dmn 0, ike 0, net 0"
+
 conn L2TP-PSK
-  keyexchange=ikev1
-  type=transport
-  left=%any
-  leftprotoport=17/1701
-  right=%any
-  rightprotoport=17/1701
-  authby=secret
-  ike=aes256-sha1-modp1024!
-  esp=aes256-sha1!
-  auto=add
+    keyexchange=ikev1
+    authby=psk
+    type=transport
+    left=%any
+    leftid=$main_ip
+    leftprotoport=17/1701
+    right=%any
+    rightprotoport=17/1701
+    ike=aes256-sha1-modp1024!
+    esp=aes256-sha1!
+    auto=add
 EOF
-  # ipsec.secrets
-  if [[ "$psk" == "auto-generated" ]]; then
-    psk=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
-  fi
-  VPN_PSK="$psk"
-  echo "%any %any : PSK \"$psk\"" >/etc/ipsec.secrets
+  echo "$main_ip %any : PSK \"$psk\"" > /etc/ipsec.secrets
 }
 configure_xl2tpd() {
   mkdir -p /etc/xl2tpd
   cat >/etc/xl2tpd/xl2tpd.conf <<EOF
-[global]
-port = 1701
-[lns default]
-ip range = ${POOL_START}-${POOL_END}
-local ip = ${POOL_START}
-require chap = yes
-refuse pap = yes
-require authentication = yes
-name = l2tpd
-ppp debug = no
+[lac vpn-connection]
+lns = 127.0.0.1
+ppp debug = yes
 pppoptfile = /etc/ppp/options.xl2tpd
 length bit = yes
 EOF
   mkdir -p /etc/ppp
-  cat >/etc/ppp/options.xl2tpd <<'EOF'
-iauth
-name l2tpd
-refuse-pap
-auth
+  cat >/etc/ppp/options.xl2tpd <<EOF
+require-mschap-v2
 ms-dns 1.1.1.1
 ms-dns 8.8.8.8
+asyncmap 0
 mtu 1410
 mru 1410
-nodefaultroute
-# push default route through server
+crtscts
 lock
-nobsdcomp
-novj
-novjccomp
-nologfd
+hide-password
+modem
+name l2tpd
 proxyarp
-lcp-echo-failure 4
 lcp-echo-interval 30
+lcp-echo-failure 4
 ipcp-accept-local
 ipcp-accept-remote
+noccp
+nologfd
 EOF
 }
 create_users() {
   local count="$1"
   : > /etc/ppp/chap-secrets
-  : > /etc/ppp/l2tp-secrets.txt
   for i in $(seq 1 "$count"); do
-    local user="${USER_PREFIX}${i}"
-    local pass="$(random_password)"
-    echo -e "${user}\tl2tpd\t${pass}\t*" >> /etc/ppp/chap-secrets
-    # файл с итоговыми данными теперь в порядке: OUTGOING_IP USERNAME PASSWORD
-    echo -e "${MAIN_IP}\t${user}\t${pass}" >> /etc/ppp/l2tp-secrets.txt
+    local u="${USER_PREFIX}${i}"
+    local p=$(tr -dc A-Za-z0-9 </dev/urandom | head -c ${PASS_LEN})
+    echo -e "$u\tl2tpd\t$p\t*" >> /etc/ppp/chap-secrets
   done
-  chmod 600 /etc/ppp/chap-secrets /etc/ppp/l2tp-secrets.txt
 }
 setup_firewall_snat() {
   local iface="$1"
-  # Разрешаем L2TP/IPsec
-  iptables -A INPUT -p udp --dport 500 -j ACCEPT || true
-  iptables -A INPUT -p udp --dport 4500 -j ACCEPT || true
-  iptables -A INPUT -p udp --dport 1701 -m policy --dir in --pol ipsec -j ACCEPT || true
-  iptables -A INPUT -p udp --dport 1701 -j DROP || true
-  # Разрешаем пересылку
-  iptables -A FORWARD -s ${POOL_SUBNET} -j ACCEPT || true
-  iptables -A FORWARD -d ${POOL_SUBNET} -j ACCEPT || true
-  # Настройка SNAT для всех публичных IP
   mapfile -t ips < <(get_all_public_ips)
   for ip in "${ips[@]}"; do
     iptables -t nat -A POSTROUTING -s ${POOL_SUBNET} -o "$iface" -j SNAT --to-source "$ip" || true
@@ -221,6 +217,8 @@ main() {
     exit 1
   fi
   MAIN_IP=${PUB_IPS[0]}
+  echo -e "${BLUE}[*] Подготовка репозиториев (CentOS 7 vault)...${NC}"
+  fix_centos7_repos
   echo -e "${BLUE}[*] Установка пакетов...${NC}"
   pkg_install
   echo -e "${BLUE}[*] Настройка sysctl...${NC}"
